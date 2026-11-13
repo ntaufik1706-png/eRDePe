@@ -1,0 +1,133 @@
+name: RDP_TIPSUNIX - Fixed
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_hours:
+        description: 'Session timeout (hours, max 6)'
+        required: true
+        default: '6'
+        type: choice
+        options: ['1', '2', '3', '4', '5', '6']
+      tz:
+        description: 'Timezone for the runner'
+        required: true
+        default: 'UTC'
+        type: choice
+        options: ['UTC', 'Asia/Jakarta', 'America/New_York', 'Europe/London', 'Asia/Tokyo']
+      enable_chocolatey:
+        description: 'Install Chocolatey and basic tools'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  secure-rdp:
+    name: Secure RDP Session
+    runs-on: windows-latest
+    timeout-minutes: 360  # Maximum allowed by GitHub Actions
+
+    steps:
+      - name: 🕐 Set Timezone
+        run: |
+          Set-TimeZone -Id "${{ inputs.tz }}"
+          Write-Host "Timezone set to: $((Get-TimeZone).Id)"
+
+      - name: 🔧 Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 1 -Force
+          
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10 profile=domain,private,public
+          
+          Restart-Service -Name TermService -Force
+          Write-Host "✅ RDP Firewall configured"
+
+      - name: 👤 Create RDP User
+        run: |
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = [char[]](33..47)
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+          Write-Host "✅ RDP user created successfully"
+
+      - name: 📦 Install Tools (Essential)
+        if: ${{ inputs.enable_chocolatey == true }}
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          
+          choco install -y --no-progress 7zip git notepadplusplus
+
+      - name: 🌐 Install & Start Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
+          
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              if ($tsIP) { break }
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "❌ Tailscale IP assignment failed."
+              exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "✅ Tailscale connected on IP: $tsIP"
+
+      - name: 📋 Display Session Info
+        run: |
+          Write-Host "=========================================="
+          Write-Host " RDP ADDRESS : $env:TAILSCALE_IP"
+          Write-Host " USERNAME    : $env:RDP_USER"
+          Write-Host " PASSWORD    : $env:RDP_PASS"
+          Write-Host "=========================================="
+
+      - name: 🔄 Maintain Session
+        run: |
+          $timeoutHours = [int]"${{ inputs.timeout_hours }}"
+          $endTime = (Get-Date).AddHours($timeoutHours)
+          
+          while ((Get-Date) -lt $endTime) {
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session Active... IP: $env:TAILSCALE_IP"
+              Start-Sleep -Seconds 300
+          }
+
+      - name: 🧹 Cleanup
+        if: always()
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" down 2>$null
+          Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
