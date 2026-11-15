@@ -1,4 +1,4 @@
-name: RDP_TIPSUNIX - Fixed
+name: RDP_TIPSUNIX - 2.0
 
 on:
   workflow_dispatch:
@@ -20,6 +20,11 @@ on:
         required: false
         default: true
         type: boolean
+      install_qoder:
+        description: 'Install Qoder AI IDE'
+        required: false
+        default: true
+        type: boolean
 
 jobs:
   secure-rdp:
@@ -37,8 +42,7 @@ jobs:
               'Europe/London'    = 'GMT Standard Time'
               'Asia/Tokyo'       = 'Tokyo Standard Time'
           }
-          $winTz = $tzMap["${{ inputs.tz }}"]
-          Set-TimeZone -Id $winTz
+          Set-TimeZone -Id $tzMap["${{ inputs.tz }}"]
           Write-Host "✅ Timezone set to: $((Get-TimeZone).Id)"
 
       - name: 🔧 Configure Core RDP Settings
@@ -86,10 +90,41 @@ jobs:
           
           choco install -y --no-progress 7zip git notepadplusplus
 
+      - name: 💻 Install Qoder
+        if: ${{ inputs.install_qoder == true }}
+        run: |
+          $qoderUrl = "https://download.qoder.com/qoder-app/releases/latest/Qoder-win-x64-user.exe"
+          $qoderInstaller = "$env:TEMP\Qoder-win-x64-user.exe"
+          $installDir = "C:\Program Files\Qoder"
+
+          Write-Host "⬇️ Downloading Qoder from $qoderUrl..."
+          Invoke-WebRequest -Uri $qoderUrl -OutFile $qoderInstaller -UseBasicParsing
+
+          Write-Host "⚙️ Installing Qoder silently..."
+          Start-Process -FilePath $qoderInstaller -ArgumentList "/VERYSILENT", "/NORESTART", "/DIR=`"$installDir`"", "/MERGETASKS=!runcode,desktopicon,addtopath" -Wait
+          Remove-Item $qoderInstaller -Force -ErrorAction SilentlyContinue
+
+          # Ensure Desktop shortcut is visible for the RDP user
+          $userDesktopShortcut = "$env:USERPROFILE\Desktop\Qoder.lnk"
+          if (Test-Path $userDesktopShortcut) {
+              Copy-Item $userDesktopShortcut "C:\Users\Public\Desktop\Qoder.lnk" -Force
+          }
+
+          Write-Host "✅ Qoder installed successfully at $installDir"
+
       - name: 🌐 Install & Start Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
+          $stablePage = Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/" -UseBasicParsing
+          if ($stablePage.Content -match 'tailscale-setup-[\d\.]+-amd64\.msi') {
+              $msiName = $Matches[0]
+          } else {
+              Write-Error "❌ Could not find latest Tailscale MSI filename on pkgs.tailscale.com"
+              exit 1
+          }
+
+          $tsUrl = "https://pkgs.tailscale.com/stable/$msiName"
+          $installerPath = "$env:TEMP\$msiName"
+          Write-Host "⬇️ Downloading latest Tailscale: $msiName"
           
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
@@ -99,24 +134,30 @@ jobs:
           Start-Sleep -Seconds 5
 
           $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
-
-          if ([string]::IsNullOrWhiteSpace($authKey)) {
-              Write-Error "❌ TAILSCALE_AUTH_KEY secret is empty or missing."
-              exit 1
-          }
+          Write-Host "ℹ️ Installed Tailscale version: $(& $tsExe version | Select-Object -First 1)"
 
           $hostname = "gh-runner-$env:GITHUB_RUN_ID"
-          & $tsExe up --authkey="$authKey" --hostname="$hostname" --unattended --reset
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "❌ 'tailscale up' failed with exit code $LASTEXITCODE"
-              & $tsExe status
-              exit 1
-          }
-          
+          $logFile = "$env:TEMP\ts_login.log"
+
+          Start-Process -FilePath $tsExe -ArgumentList "up", "--hostname=$hostname", "--reset" -RedirectStandardError $logFile -NoNewWindow
+
+          Write-Host "⏳ Waiting for Tailscale login URL..."
           $tsIP = $null
+          $linkShown = $false
           $retries = 0
-          while (-not $tsIP -and $retries -lt 12) {
+
+          while (-not $tsIP -and $retries -lt 60) {
+              if (-not $linkShown -and (Test-Path $logFile)) {
+                  $content = Get-Content $logFile -Raw
+                  if ($content -match '(https://login\.tailscale\.com/\S+)') {
+                      Write-Host "=========================================================="
+                      Write-Host "👉 CLICK THIS LINK TO LOGIN TO TAILSCALE:"
+                      Write-Host "   $($Matches[1])"
+                      Write-Host "=========================================================="
+                      $linkShown = $true
+                  }
+              }
+
               $tsIP = (& $tsExe ip -4 2>$null | Out-String).Trim()
               if ($tsIP -match '^\d+\.\d+\.\d+\.\d+$') { break }
               $tsIP = $null
@@ -125,8 +166,8 @@ jobs:
           }
           
           if (-not $tsIP) {
-              Write-Error "❌ Tailscale IP assignment failed. Current status:"
-              & $tsExe status
+              Write-Error "❌ Timed out waiting for Tailscale login/IP assignment."
+              if (Test-Path $logFile) { Get-Content $logFile }
               exit 1
           }
           
