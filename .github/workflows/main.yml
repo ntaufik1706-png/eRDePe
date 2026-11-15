@@ -1,4 +1,4 @@
-name: RDP_TIPSUNIX - 2.0
+name: RDP_TIPSUNIX - 2.1
 
 on:
   workflow_dispatch:
@@ -20,8 +20,8 @@ on:
         required: false
         default: true
         type: boolean
-      install_qoder:
-        description: 'Install Qoder AI IDE'
+      download_qoder:
+        description: 'Download Qoder installer to Desktop'
         required: false
         default: true
         type: boolean
@@ -90,27 +90,22 @@ jobs:
           
           choco install -y --no-progress 7zip git notepadplusplus
 
-      - name: 💻 Install Qoder
-        if: ${{ inputs.install_qoder == true }}
+      - name: ⬇️ Download Qoder Installer
+        if: ${{ inputs.download_qoder == true }}
         run: |
           $qoderUrl = "https://download.qoder.com/qoder-app/releases/latest/Qoder-win-x64-user.exe"
-          $qoderInstaller = "$env:TEMP\Qoder-win-x64-user.exe"
-          $installDir = "C:\Program Files\Qoder"
+          $destPath = "C:\Users\Public\Desktop\Qoder-win-x64-user.exe"
 
-          Write-Host "⬇️ Downloading Qoder from $qoderUrl..."
-          Invoke-WebRequest -Uri $qoderUrl -OutFile $qoderInstaller -UseBasicParsing
+          Write-Host "⬇️ Downloading Qoder installer to Public Desktop..."
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri $qoderUrl -OutFile $destPath -UseBasicParsing
 
-          Write-Host "⚙️ Installing Qoder silently..."
-          Start-Process -FilePath $qoderInstaller -ArgumentList "/VERYSILENT", "/NORESTART", "/DIR=`"$installDir`"", "/MERGETASKS=!runcode,desktopicon,addtopath" -Wait
-          Remove-Item $qoderInstaller -Force -ErrorAction SilentlyContinue
-
-          # Ensure Desktop shortcut is visible for the RDP user
-          $userDesktopShortcut = "$env:USERPROFILE\Desktop\Qoder.lnk"
-          if (Test-Path $userDesktopShortcut) {
-              Copy-Item $userDesktopShortcut "C:\Users\Public\Desktop\Qoder.lnk" -Force
+          if (Test-Path $destPath) {
+              $sizeMB = [math]::Round((Get-Item $destPath).Length / 1MB, 2)
+              Write-Host "✅ Qoder downloaded to Desktop ($sizeMB MB): $destPath"
+          } else {
+              Write-Warning "⚠️ Failed to download Qoder installer."
           }
-
-          Write-Host "✅ Qoder installed successfully at $installDir"
 
       - name: 🌐 Install & Start Tailscale
         run: |
@@ -126,6 +121,7 @@ jobs:
           $installerPath = "$env:TEMP\$msiName"
           Write-Host "⬇️ Downloading latest Tailscale: $msiName"
           
+          $ProgressPreference = 'SilentlyContinue'
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
